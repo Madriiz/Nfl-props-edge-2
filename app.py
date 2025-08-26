@@ -1,11 +1,12 @@
+
 import streamlit as st
 import requests
 import pandas as pd
 
-st.set_page_config(page_title="NFL Props Edge — FanDuel (Live)", layout="wide")
-st.title("NFL Props Edge — FanDuel (Live)")
+st.set_page_config(page_title="NFL Props Edge — Live (FanDuel/DK)", layout="wide")
+st.title("NFL Props Edge — Live (FanDuel/DK)")
 
-st.caption("Uses 2024 Defense-vs-Position ranks (1 = most vulnerable, 32 = strongest). Pulls player props via The Odds API. If FanDuel is empty on your plan, try DraftKings fallback.")
+st.caption("Uses 2024 Defense-vs-Position ranks (1 = most vulnerable, 32 = strongest). Pulls player props via The Odds API. If FanDuel returns nothing, try DraftKings or broaden markets.")
 
 # --- 2024 DvP ranks (1 = softest, 32 = toughest) ---
 DVP = {
@@ -46,119 +47,138 @@ DVP = {
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 SPORT = "americanfootball_nfl"
 
-# --- Config panel ---
-with st.sidebar:
-    st.header("Settings")
-    api_key = st.secrets.get("ODDS_API_KEY", "")
-    if not api_key:
-        api_key = st.text_input("The Odds API Key", type="password")
-    regions = st.selectbox("Regions", ["us", "us,us2"], index=0)
-    books = st.multiselect("Bookmakers (first is primary)", ["fanduel","draftkings"], default=["fanduel","draftkings"])
-    show_diag = st.checkbox("Show diagnostics (raw JSON/errors)")
+# Broader market coverage to increase chances of data
+DEFAULT_MARKETS = [
+    "player_pass_yards",
+    "player_pass_attempts",
+    "player_pass_completions",
+    "player_pass_tds",
+    "player_rush_yards",
+    "player_rush_attempts",
+    "player_receiving_yards",
+    "player_receptions",
+    "player_longest_reception",
+    "player_longest_rush",
+    "player_anytime_td"
+]
 
-teams = sorted(DVP.keys())
-team = st.selectbox("Your offensive team", teams, index=teams.index("Philadelphia Eagles") if "Philadelphia Eagles" in teams else 0)
+def pos_from_market(m):
+    m = m.lower()
+    if "pass_" in m: return "QB"
+    if "rush_" in m: return "RB"
+    if "receiving" in m or "receptions" in m or "longest_reception" in m: return "WR"
+    if "anytime_td" in m: return "WR"  # mixed; treat as WR for edge
+    return None
 
 def edge_from_rank(rank:int):
     if rank <= 8: return "Over", (9-rank)*10
     if rank >= 25: return "Under", (rank-24)*10
     return "Neutral", 0
 
+# ---- Sidebar settings ----
+with st.sidebar:
+    st.header("Settings")
+    api_key = st.secrets.get("ODDS_API_KEY", "")
+    if not api_key:
+        api_key = st.text_input("The Odds API key", type="password")
+    regions = st.selectbox("Regions", ["us","us,us2"], index=1)
+    primary_book = st.selectbox("Primary bookmaker", ["fanduel","draftkings"], index=0)
+    secondary_book = st.checkbox("Also fetch DraftKings (fallback)") 
+    markets = st.multiselect("Markets to request", DEFAULT_MARKETS, default=DEFAULT_MARKETS)
+    diagnostics = st.checkbox("Show diagnostics")
+
+teams = sorted(DVP.keys())
+team = st.selectbox("Your offensive team", teams, index=teams.index("Philadelphia Eagles") if "Philadelphia Eagles" in teams else 0)
+
+@st.cache_data(ttl=90)
 def fetch_events(api_key, regions):
     url = f"{ODDS_API_BASE}/sports/{SPORT}/odds"
-    params = {"apiKey": api_key, "regions": regions, "bookmakers": ",".join(["fanduel","draftkings"]), "markets": "h2h", "oddsFormat":"american"}
+    params = {"apiKey": api_key, "regions": regions, "markets": "h2h", "bookmakers": ",".join(["fanduel","draftkings"]), "oddsFormat":"american"}
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
 
-def fetch_event_props(api_key, event_id, bookmaker):
-    markets = "player_pass_yards,player_rush_yards,player_receiving_yards,player_receptions"
+@st.cache_data(ttl=90)
+def fetch_props(api_key, event_id, bookmakers, markets, regions):
     url = f"{ODDS_API_BASE}/sports/{SPORT}/events/{event_id}/odds"
-    params = {"apiKey": api_key, "regions": regions, "bookmakers": bookmaker, "markets": markets, "oddsFormat":"american"}
+    params = {"apiKey": api_key, "regions": regions, "bookmakers": ",".join(bookmakers), "markets": ",".join(markets), "oddsFormat":"american"}
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
 
-# --- Left: opponent ranks and event selector ---
+# ---- Load events ----
+if not api_key:
+    st.info("Enter your API key in the sidebar.")
+    st.stop()
+
+try:
+    events = fetch_events(api_key, regions)
+except Exception as e:
+    st.error(f"Failed to fetch events: {e}")
+    if diagnostics:
+        st.exception(e)
+    st.stop()
+
+# Build list for selection
+event_labels = []
+auto_idx = 0
+for i, ev in enumerate(events):
+    home, away = ev.get("home_team",""), ev.get("away_team","")
+    label = f"{away} @ {home} — {ev.get('commence_time','')}"
+    event_labels.append(label)
+    if team in (home, away):
+        auto_idx = i
+
+sel = st.selectbox("Upcoming event", event_labels, index=auto_idx)
+event = events[event_labels.index(sel)]
+home, away = event["home_team"], event["away_team"]
+opponent = away if home == team else home
+
 colL, colR = st.columns([1,2], gap="large")
 
 with colL:
-    st.subheader("Opponent & DvP (2024)")
-    if not api_key:
-        st.info("Enter your The Odds API key to load events.")
-        st.stop()
-    try:
-        events = fetch_events(api_key, regions)
-    except Exception as e:
-        st.error(f"Failed to fetch events: {e}")
-        if show_diag:
-            st.exception(e)
-        st.stop()
-
-    # auto-pick event; also provide a manual select
-    idx_auto = None
-    event_options = []
-    for i, ev in enumerate(events):
-        home, away = ev.get("home_team",""), ev.get("away_team","")
-        event_options.append(f"{away} @ {home} — {ev.get('commence_time','')}")
-        if team in (home, away):
-            idx_auto = i
-    sel = st.selectbox("Upcoming event", event_options, index=idx_auto if idx_auto is not None else 0)
-    event = events[event_options.index(sel)]
-    home, away = event["home_team"], event["away_team"]
-    opponent = away if home == team else home
-
-    st.write(f"**Selected game:** {away} @ {home}")
-    st.write(f"**Opponent:** {opponent}")
+    st.subheader("Opponent DvP (2024)")
     opp = pd.DataFrame([DVP.get(opponent, {"QB":"?","RB":"?","WR":"?","TE":"?"})], index=[opponent])
     st.dataframe(opp, use_container_width=True)
 
-# --- Right: FanDuel props with DraftKings fallback ---
 with colR:
-    st.subheader("Player Props & Edge")
+    st.subheader("Player props & edge")
+    books = [primary_book] + (["draftkings"] if (secondary_book and primary_book!="draftkings") else [])
     rows = []
     errors = []
-
-    for bk in books:
-        try:
-            props = fetch_event_props(api_key, event["id"], bk)
-        except Exception as e:
-            errors.append(f"{bk}: {e}")
-            continue
-
-        for src in props:
+    try:
+        data = fetch_props(api_key, event["id"], books, markets, regions)
+        for src in data:
             for bm in src.get("bookmakers", []):
-                if bm.get("key") != bk: 
-                    continue
+                bk = bm.get("key")
                 for market in bm.get("markets", []):
-                    mkey = market.get("key","").lower()
-                    if "player_" not in mkey: 
-                        continue
-                    pos = "QB" if "pass_yards" in mkey else "RB" if "rush_yards" in mkey else "WR"
-                    rank = DVP.get(opponent, {}).get(pos, 16)
+                    mkey = market.get("key","")
+                    pos = pos_from_market(mkey)
+                    rank = DVP.get(opponent, {}).get(pos, 16) if pos else 16
                     lean, edge = edge_from_rank(rank)
                     for out in market.get("outcomes", []):
-                        name = out.get("description") or out.get("name")
                         rows.append({
                             "Book": bk,
-                            "Player": name,
                             "Market": mkey,
+                            "Player": out.get("description") or out.get("name"),
                             "Line": out.get("point"),
                             "Price": out.get("price"),
-                            "Position": pos,
-                            "Opp DVP Rank": rank,
-                            "Lean": lean,
-                            "EdgeScore": edge
+                            "Position": pos or "?",
+                            "Opp DVP Rank": rank if pos else "?",
+                            "Lean": lean if pos else "Neutral",
+                            "EdgeScore": edge if pos else 0
                         })
+    except Exception as e:
+        errors.append(str(e))
 
     if rows:
-        df = pd.DataFrame(rows).sort_values(["Book","EdgeScore","Position"], ascending=[True,False,True])
+        df = pd.DataFrame(rows).sort_values(["Book","Market","EdgeScore"], ascending=[True, True, False])
         st.dataframe(df, use_container_width=True)
     else:
-        st.warning("No player props returned. This usually means your plan/coverage doesn't include props for this book/market yet.")
-        if errors and show_diag:
+        st.warning("No player props returned for the chosen combo. Try: (1) adding DraftKings, (2) switching regions to 'us,us2', (3) picking a different event, (4) reducing markets to the core four. On some free keys, props coverage can be limited at certain times.")
+        if errors and diagnostics:
             st.write("Errors:", errors)
 
-    if show_diag:
-        with st.expander("Diagnostics: raw events JSON"):
-            st.write(events)
+if diagnostics:
+    with st.expander("Diagnostics: raw event JSON"):
+        st.write(event)
